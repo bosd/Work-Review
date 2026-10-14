@@ -1415,16 +1415,11 @@ fn recording_loop_decision(
     }
 }
 
-fn should_run_ocr(
-    is_new_activity: bool,
-    elapsed_since_ocr: Option<Duration>,
-    screenshot_interval: u64,
-) -> bool {
-    is_new_activity
-        || match elapsed_since_ocr {
-            None => true,
-            Some(elapsed) => elapsed >= Duration::from_secs(screenshot_interval),
-        }
+fn should_run_ocr(elapsed_since_ocr: Option<Duration>, screenshot_interval: u64) -> bool {
+    match elapsed_since_ocr {
+        None => true,
+        Some(elapsed) => elapsed >= Duration::from_secs(screenshot_interval),
+    }
 }
 
 fn monitoring_poll_interval_ms_for_platform(is_macos: bool) -> u64 {
@@ -2732,10 +2727,10 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                     false
                 };
 
-                // 新会话必须保留首次 OCR，冷却只限制连续会话的重复识别。
+                // 新建与合并共用 OCR 冷却，窗口切换仍保留截图。
+                // ponytail: 冷却期内的短活动可能没有 OCR；需要逐条索引时再加有界后台队列。
                 let should_run_ocr = screenshots_enabled
                     && should_run_ocr(
-                        !is_merge,
                         last_ocr_time.map(|last| last.elapsed()),
                         screenshot_interval,
                     );
@@ -3107,10 +3102,19 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                                         );
 
                                         // 异步 OCR（新建活动的截图已保存，不删除）
-                                        last_ocr_time = Some(std::time::Instant::now());
+                                        if should_run_ocr {
+                                            last_ocr_time = Some(std::time::Instant::now());
+                                        }
                                         let state_clone = state.clone();
                                         let ocr_sem = ocr_semaphore.clone();
                                         tokio::spawn(async move {
+                                            if !should_run_ocr {
+                                                if let Some(temp_path) = temporary_ocr_source_path {
+                                                    let _ = std::fs::remove_file(temp_path);
+                                                }
+                                                return;
+                                            }
+
                                             // 非阻塞获取 permit，满载时跳过 OCR
                                             let _permit = match ocr_sem.try_acquire_owned() {
                                                 Ok(p) => p,
@@ -4846,12 +4850,25 @@ mod tests {
     }
 
     #[test]
-    fn ocr应遵循截图间隔且首次立即执行() {
-        assert!(should_run_ocr(false, None, 30));
-        assert!(!should_run_ocr(false, Some(Duration::from_secs(29)), 30));
-        assert!(should_run_ocr(false, Some(Duration::from_secs(30)), 30));
-        assert!(should_run_ocr(true, Some(Duration::from_secs(5)), 30));
-        assert!(should_run_ocr(true, Some(Duration::ZERO), 30));
+    fn ocr应遵循全局间隔且首次立即执行() {
+        assert!(should_run_ocr(None, 30));
+        assert!(!should_run_ocr(Some(Duration::from_secs(29)), 30));
+        assert!(should_run_ocr(Some(Duration::from_secs(30)), 30));
+        assert!(!should_run_ocr(Some(Duration::from_secs(5)), 30));
+        assert!(!should_run_ocr(Some(Duration::ZERO), 30));
+
+        // 连续 80 分钟每秒切换窗口，30 秒间隔最多启动 160 次 OCR。
+        let mut last_ocr_at = None;
+        let mut ocr_count = 0;
+        for second in 0..80 * 60 {
+            let now = Duration::from_secs(second);
+            let elapsed = last_ocr_at.map(|last| now - last);
+            if should_run_ocr(elapsed, 30) {
+                last_ocr_at = Some(now);
+                ocr_count += 1;
+            }
+        }
+        assert_eq!(ocr_count, 160);
     }
 
     #[test]

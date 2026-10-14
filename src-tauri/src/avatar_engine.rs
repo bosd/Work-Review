@@ -2,8 +2,8 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tauri::{
-    AppHandle, Emitter, LogicalSize, Manager, Monitor, PhysicalPosition, Position, Size,
-    WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    AppHandle, Emitter, LogicalSize, Manager, Monitor, PhysicalPosition, PhysicalSize, Position,
+    Size, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 
 pub const AVATAR_WINDOW_LABEL: &str = "avatar";
@@ -455,8 +455,13 @@ pub fn sync_avatar_window(
             };
             let effective_position =
                 remembered_avatar_position(had_existing_window, current_position, saved_position);
-            let (x, y) =
-                default_avatar_position(app, normalized_scale, effective_position, body_hidden);
+            let (x, y) = default_avatar_position(
+                app,
+                normalized_scale,
+                effective_position,
+                expanded,
+                body_hidden,
+            );
             resize_avatar_window(&window, normalized_scale, expanded, body_hidden);
             let _ = window.set_always_on_top(true);
             let _ = window.set_visible_on_all_workspaces(true);
@@ -646,9 +651,14 @@ fn clamp_window_within_current_monitor(
         width: work_area.size.width as i32,
         height: work_area.size.height as i32,
     };
-    let (window_width, window_height) = avatar_window_size(scale, expanded, body_hidden);
-    let (clamped_x, clamped_y) =
-        clamp_avatar_position_with_size(bounds, current.x, current.y, window_width, window_height);
+    let size = avatar_window_physical_size(scale, expanded, body_hidden, monitor.scale_factor());
+    let (clamped_x, clamped_y) = clamp_avatar_position_with_size(
+        bounds,
+        current.x,
+        current.y,
+        size.width as f64,
+        size.height as f64,
+    );
     if (clamped_x, clamped_y) != (current.x, current.y) {
         let _ = window.set_position(Position::Physical(PhysicalPosition::new(
             clamped_x, clamped_y,
@@ -731,13 +741,21 @@ fn default_avatar_position(
     app: &AppHandle,
     scale: f64,
     saved_position: Option<(i32, i32)>,
+    expanded: bool,
     body_hidden: bool,
 ) -> (i32, i32) {
     // 多屏适配：已保存位置时，优先用该位置所在的显示器来 clamp，
     // 避免副屏坐标被主屏的工作区边界强行拉回（issue #120）。
     if let Some((saved_x, saved_y)) = saved_position {
-        if let Some(bounds) = monitor_bounds_for_point(app, saved_x, saved_y) {
-            return resolve_avatar_position(bounds, None, saved_position, scale, body_hidden);
+        if let Some(monitor) = monitor_for_point(app, saved_x, saved_y) {
+            return compute_avatar_position(
+                monitor,
+                None,
+                saved_position,
+                scale,
+                expanded,
+                body_hidden,
+            );
         }
     }
 
@@ -753,20 +771,33 @@ fn default_avatar_position(
                 _ => None,
             };
 
-            return compute_avatar_position(monitor, anchor, saved_position, scale, body_hidden);
+            return compute_avatar_position(
+                monitor,
+                anchor,
+                saved_position,
+                scale,
+                expanded,
+                body_hidden,
+            );
         }
     }
 
     if let Ok(Some(monitor)) = app.primary_monitor() {
-        return compute_avatar_position(monitor, None, saved_position, scale, body_hidden);
+        return compute_avatar_position(
+            monitor,
+            None,
+            saved_position,
+            scale,
+            expanded,
+            body_hidden,
+        );
     }
 
     saved_position.unwrap_or((40, 40))
 }
 
-/// 在所有可用显示器中，找到包含 (x, y) 的那个，返回其工作区物理像素 bounds。
-/// 用于多屏场景下根据桌宠保存位置定位正确的显示器。
-fn monitor_bounds_for_point(app: &AppHandle, x: i32, y: i32) -> Option<Rect> {
+/// 根据保存的物理坐标选择显示器，保留其工作区与 DPI 信息。
+fn monitor_for_point(app: &AppHandle, x: i32, y: i32) -> Option<Monitor> {
     let monitors = app.available_monitors().ok()?;
     for monitor in monitors {
         let position = monitor.position();
@@ -785,13 +816,7 @@ fn monitor_bounds_for_point(app: &AppHandle, x: i32, y: i32) -> Option<Rect> {
             bounds.width as i64,
             bounds.height as i64,
         ) {
-            let work_area = monitor.work_area();
-            return Some(Rect {
-                x: work_area.position.x,
-                y: work_area.position.y,
-                width: work_area.size.width as i32,
-                height: work_area.size.height as i32,
-            });
+            return Some(monitor);
         }
     }
     None
@@ -802,6 +827,7 @@ fn compute_avatar_position(
     anchor: Option<Rect>,
     saved_position: Option<(i32, i32)>,
     scale: f64,
+    expanded: bool,
     body_hidden: bool,
 ) -> (i32, i32) {
     let work_area = monitor.work_area();
@@ -812,17 +838,17 @@ fn compute_avatar_position(
         height: work_area.size.height as i32,
     };
 
-    resolve_avatar_position(bounds, anchor, saved_position, scale, body_hidden)
+    let size = avatar_window_physical_size(scale, expanded, body_hidden, monitor.scale_factor());
+    resolve_avatar_position(bounds, anchor, saved_position, size)
 }
 
 fn resolve_avatar_position(
     bounds: Rect,
     anchor: Option<Rect>,
     saved_position: Option<(i32, i32)>,
-    scale: f64,
-    body_hidden: bool,
+    size: PhysicalSize<u32>,
 ) -> (i32, i32) {
-    let (window_width, window_height) = avatar_window_size(scale, false, body_hidden);
+    let (window_width, window_height) = (size.width as f64, size.height as f64);
 
     if let Some((saved_x, saved_y)) = saved_position {
         return clamp_avatar_position_with_size(
@@ -875,6 +901,16 @@ fn clamp_avatar_position_with_size(
         preferred_x.clamp(bounds.x, max_x),
         preferred_y.clamp(bounds.y, max_y),
     )
+}
+
+fn avatar_window_physical_size(
+    scale: f64,
+    expanded: bool,
+    body_hidden: bool,
+    scale_factor: f64,
+) -> PhysicalSize<u32> {
+    let (width, height) = avatar_window_size(scale, expanded, body_hidden);
+    LogicalSize::new(width, height).to_physical(scale_factor)
 }
 
 fn avatar_window_size(scale: f64, expanded: bool, body_hidden: bool) -> (f64, f64) {
@@ -1268,6 +1304,48 @@ mod tests {
     }
 
     #[test]
+    fn 高dpi下紧凑和展开桌宠应完整留在正负坐标屏幕内() {
+        for scale_factor in [1.0, 1.5, 2.0] {
+            for expanded in [false, true] {
+                let size = super::avatar_window_physical_size(1.0, expanded, false, scale_factor);
+                let (logical_width, logical_height) = if expanded {
+                    (380.0, 440.0)
+                } else {
+                    (276.0, 248.0)
+                };
+                assert_eq!(size.width, (logical_width * scale_factor) as u32);
+                assert_eq!(size.height, (logical_height * scale_factor) as u32);
+
+                for (screen_x, screen_y) in [(0, 0), (-2000, -1200)] {
+                    let bounds = Rect {
+                        x: screen_x,
+                        y: screen_y,
+                        width: 2000,
+                        height: 1200,
+                    };
+                    let max_x = bounds.x + bounds.width - size.width as i32;
+                    let max_y = bounds.y + bounds.height - size.height as i32;
+                    let (x, y) = resolve_avatar_position(
+                        bounds,
+                        None,
+                        Some((bounds.x + bounds.width, bounds.y + bounds.height)),
+                        size,
+                    );
+                    assert_eq!((x, y), (max_x, max_y));
+                    assert_eq!(
+                        resolve_avatar_position(bounds, Some(bounds), None, size),
+                        (max_x - 8, max_y - 8)
+                    );
+                }
+            }
+        }
+        let fractional_size = super::avatar_window_physical_size(0.9, false, false, 2.0);
+        assert_eq!((fractional_size.width, fractional_size.height), (497, 446));
+        let hidden_size = super::avatar_window_physical_size(1.0, false, true, 2.0);
+        assert_eq!((hidden_size.width, hidden_size.height), (552, 220));
+    }
+
+    #[test]
     fn 已保存桌宠位置应优先于默认吸附位置() {
         let bounds = Rect {
             x: 0,
@@ -1282,7 +1360,8 @@ mod tests {
             height: 600,
         };
 
-        let (x, y) = resolve_avatar_position(bounds, Some(anchor), Some((120, 240)), 0.9, false);
+        let size = super::avatar_window_physical_size(0.9, false, false, 1.0);
+        let (x, y) = resolve_avatar_position(bounds, Some(anchor), Some((120, 240)), size);
 
         assert_eq!((x, y), (120, 240));
     }
@@ -1296,7 +1375,8 @@ mod tests {
             height: 720,
         };
 
-        let (x, y) = resolve_avatar_position(bounds, None, Some((1600, 900)), 0.9, false);
+        let size = super::avatar_window_physical_size(0.9, false, false, 1.0);
+        let (x, y) = resolve_avatar_position(bounds, None, Some((1600, 900)), size);
 
         assert_eq!(
             (x, y),
@@ -1423,7 +1503,8 @@ mod tests {
         };
         let orphan_saved = (5000, 5000);
 
-        let (x, y) = resolve_avatar_position(fallback_bounds, None, Some(orphan_saved), 0.9, false);
+        let size = super::avatar_window_physical_size(0.9, false, false, 1.0);
+        let (x, y) = resolve_avatar_position(fallback_bounds, None, Some(orphan_saved), size);
 
         let (w, h) = avatar_window_size(0.9, false, false);
         assert_eq!(

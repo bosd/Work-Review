@@ -43,7 +43,7 @@
     "@tauri-apps/plugin-dialog": "^2.7.0",
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-shell": "^2.3.4",
-    "dompurify": "^3.4.12",
+    "dompurify": "^3.4.17",
     "marked": "^11.0.0",
     "svelte-spa-router": "^4.0.0"
   }

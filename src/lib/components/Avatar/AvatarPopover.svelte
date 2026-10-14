@@ -29,8 +29,8 @@
   $: compactBubbleMessage = !bubbleMessage?.includes('\n') && (bubbleMessage?.trim().length ?? 0) <= 14;
   // 约束弹框宽度不超出桌宠窗口：82vw 在 276px 窗口内 ≈ 226px，留出边距
   $: bubblePanelStyle = compactBubbleMessage
-    ? 'width: fit-content; min-width: 120px; max-width: min(82vw, 196px);'
-    : 'width: min(82vw, 336px); min-width: 160px; max-width: min(82vw, 336px);';
+    ? 'width: fit-content; min-width: min(82vw, 120px); max-width: min(82vw, 196px);'
+    : 'width: min(82vw, 336px); min-width: min(82vw, 160px); max-width: min(82vw, 336px);';
 </script>
 
 {#if bubble}

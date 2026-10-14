@@ -126,8 +126,8 @@ test('状态气泡应采用贴头短气泡，减少白卡感和视觉侵入', ()
   assert.doesNotMatch(source, /writing-mode: vertical-rl/);
   assert.match(source, /compactBubbleMessage/);
   assert.match(source, /bubblePanelStyle = compactBubbleMessage/);
-  assert.match(source, /width: fit-content; min-width: 120px; max-width: min\(82vw, 196px\);/);
-  assert.match(source, /width: min\(82vw, 336px\); min-width: 160px; max-width: min\(82vw, 336px\);/);
+  assert.match(source, /width: fit-content; min-width: min\(82vw, 120px\); max-width: min\(82vw, 196px\);/);
+  assert.match(source, /width: min\(82vw, 336px\); min-width: min\(82vw, 160px\); max-width: min\(82vw, 336px\);/);
   assert.match(source, /min-height: 40px/);
   assert.match(source, /padding: 6px 14px 7px 14px/);
   assert.match(source, /display: block;/);
