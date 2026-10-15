@@ -18,6 +18,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 use work_review_core::config::DEFAULT_LOCALHOST_API_PORT;
 use work_review_core::error::{AppError, Result};
+use work_review_core::privacy::{PrivacyAction, PrivacyFilter};
 
 pub const LOCALHOST_API_HOST: &str = "127.0.0.1";
 
@@ -658,39 +659,62 @@ fn handle_current_context(state: &Arc<Mutex<AppState>>) -> Result<HttpResponse> 
     let active_window = crate::monitor::get_active_window_fast().ok();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-    let recent_apps: Vec<String> = {
-        let s = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-        let activities = s
-            .database
-            .get_timeline(&today, Some(10), None)
-            .unwrap_or_default();
-        let (ignored_apps, excluded_domains) = commands::collect_privacy_filters(&s);
-        let activities =
-            commands::filter_activities_by_privacy(activities, &ignored_apps, &excluded_domains);
-        let mut seen = std::collections::HashSet::new();
-        activities
-            .iter()
-            .filter_map(|a| {
-                if seen.insert(a.app_name.clone()) {
-                    Some(a.app_name.clone())
-                } else {
-                    None
-                }
-            })
-            .take(5)
-            .collect()
-    };
+    let s = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+    let activities = s
+        .database
+        .get_timeline(&today, Some(10), None)
+        .unwrap_or_default();
+    let (ignored_apps, excluded_domains) = commands::collect_privacy_filters(&s);
+    let activities =
+        commands::filter_activities_by_privacy(activities, &ignored_apps, &excluded_domains);
+    let mut seen = std::collections::HashSet::new();
+    let recent_apps = activities
+        .iter()
+        .filter(|a| seen.insert(a.app_name.clone()))
+        .map(|a| a.app_name.clone())
+        .take(5)
+        .collect();
 
+    Ok(build_current_context_response(
+        active_window,
+        recent_apps,
+        &s.privacy_filter,
+    ))
+}
+
+fn build_current_context_response(
+    active_window: Option<crate::monitor::ActiveWindow>,
+    recent_apps: Vec<String>,
+    privacy_filter: &PrivacyFilter,
+) -> HttpResponse {
+    let active_window = active_window.and_then(|mut window| {
+        match privacy_filter.check_privacy_full(
+            &window.app_name,
+            &window.window_title,
+            window.browser_url.as_deref(),
+        ) {
+            PrivacyAction::Skip => None,
+            PrivacyAction::Anonymize => {
+                window.window_title = "[内容已脱敏]".to_string();
+                window.browser_url = None;
+                Some(window)
+            }
+            PrivacyAction::Record => {
+                window.window_title = privacy_filter.filter_text(&window.window_title);
+                Some(window)
+            }
+        }
+    });
     let (primary_app, window_title, browser_url) = match &active_window {
         Some(w) => (
-            w.app_name.clone(),
-            w.window_title.clone(),
-            w.browser_url.clone(),
+            w.app_name.as_str(),
+            w.window_title.as_str(),
+            w.browser_url.as_deref(),
         ),
-        None => (String::new(), String::new(), None),
+        None => ("", "", None),
     };
 
-    Ok(HttpResponse::json(
+    HttpResponse::json(
         200,
         &serde_json::json!({
             "primary_app": primary_app,
@@ -699,7 +723,7 @@ fn handle_current_context(state: &Arc<Mutex<AppState>>) -> Result<HttpResponse> 
             "recent_apps": recent_apps,
             "is_live": active_window.is_some(),
         }),
-    ))
+    )
 }
 
 fn ensure_api_capture_enabled(screenshots_enabled: bool) -> Result<()> {
@@ -1202,13 +1226,79 @@ fn authorize_request(request: &ParsedRequest, state: &Arc<Mutex<AppState>>) -> R
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_api_capture_permit, build_capture_payload, effective_api_host,
-        ensure_api_capture_enabled, extract_bearer_token, mask_localhost_api_token,
-        parse_generate_report_params, request_auth_mode, ParsedRequest, RequestAuthMode,
+        acquire_api_capture_permit, build_capture_payload, build_current_context_response,
+        effective_api_host, ensure_api_capture_enabled, extract_bearer_token,
+        mask_localhost_api_token, parse_generate_report_params, request_auth_mode, ParsedRequest,
+        RequestAuthMode,
     };
+    use crate::monitor::ActiveWindow;
     use crate::screenshot::ScreenshotResult;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+    use work_review_core::config::{AppPrivacyRule, PrivacyConfig, PrivacyLevel};
+    use work_review_core::privacy::PrivacyFilter;
+
+    #[test]
+    fn 实时上下文响应应尊重忽略脱敏域名与敏感文本规则() {
+        let config = PrivacyConfig {
+            app_rules: vec![
+                AppPrivacyRule {
+                    app_name: "1Password".into(),
+                    level: PrivacyLevel::Ignored,
+                },
+                AppPrivacyRule {
+                    app_name: "Private App".into(),
+                    level: PrivacyLevel::Anonymized,
+                },
+            ],
+            excluded_domains: vec!["private.example".into()],
+            ..PrivacyConfig::default()
+        };
+        let filter = PrivacyFilter::from_config(&config);
+        let window = |app: &str, title: &str, url: Option<&str>| ActiveWindow {
+            app_name: app.into(),
+            window_title: title.into(),
+            browser_url: url.map(str::to_string),
+            executable_path: None,
+            window_bounds: None,
+            is_minimized: false,
+        };
+        let response = |window| {
+            let response = build_current_context_response(window, vec!["Editor".into()], &filter);
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()
+        };
+
+        for window in [
+            None,
+            Some(window("1Password", "Vault", None)),
+            Some(window(
+                "Google Chrome",
+                "Internal",
+                Some("https://private.example/page"),
+            )),
+        ] {
+            let json = response(window);
+            assert_eq!(json["primary_app"], "");
+            assert_eq!(json["window_title"], "");
+            assert!(json["browser_url"].is_null());
+            assert_eq!(json["is_live"], false);
+            assert_eq!(json["recent_apps"], serde_json::json!(["Editor"]));
+        }
+        let json = response(Some(window(
+            "Private App",
+            "Private title",
+            Some("https://example.org"),
+        )));
+        assert_eq!(json["primary_app"], "Private App");
+        assert_eq!(json["window_title"], "[内容已脱敏]");
+        assert!(json["browser_url"].is_null());
+        assert_eq!(json["is_live"], true);
+
+        let json = response(Some(window("Editor", "Contact person@example.org", None)));
+        assert_eq!(json["window_title"], "Contact [已过滤]");
+        assert_eq!(json["primary_app"], "Editor");
+        assert_eq!(json["is_live"], true);
+    }
 
     fn parsed_request(
         method: &str,

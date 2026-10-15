@@ -461,16 +461,30 @@ impl PrivacyConfig {
             .any(|k| title_lower.contains(&k.to_lowercase()))
     }
 
-    /// 从 URL 中提取域名
+    /// 从完整 URL 或裸域名（可带端口）提取小写主机名，保留 www 和子域。
+    /// 无法解析或没有主机时返回空字符串，供调用者跳过匹配或分类。
     pub fn extract_domain(url: &str) -> String {
-        let without_protocol = url
-            .trim_start_matches("https://")
-            .trim_start_matches("http://");
-        without_protocol
-            .split('/')
-            .next()
-            .unwrap_or("")
-            .to_lowercase()
+        let url = url.trim();
+        let has_scheme = url
+            .split_once("://")
+            .is_some_and(|(scheme, _)| !scheme.contains(['/', '?', '#']));
+        let parsed = if has_scheme {
+            reqwest::Url::parse(url)
+        } else {
+            // 裸域名不接受相对路径或用户信息，避免被补全为另一个主机。
+            let authority = url.split(['/', '?', '#']).next().unwrap_or("");
+            if url.starts_with(['/', '\\']) || authority.contains('@') {
+                return String::new();
+            }
+            reqwest::Url::parse(&format!("https://{url}"))
+        };
+        parsed
+            .ok()
+            .and_then(|url| {
+                url.host_str()
+                    .map(|host| host.trim_end_matches('.').to_lowercase())
+            })
+            .unwrap_or_default()
     }
 
     /// 后缀匹配域名：domain == pattern 或 domain 以 .pattern 结尾
@@ -560,8 +574,11 @@ pub enum ScreenshotWidthMode {
 pub struct StorageConfig {
     /// 截图保留天数（超过后删除截图文件）
     pub screenshot_retention_days: u32,
-    /// 元数据保留天数（超过后删除数据库记录）
+    /// 元数据保留天数，0 表示永久保留；仅在显式开启自动清理后生效。
     pub metadata_retention_days: u32,
+    /// 旧版本未执行元数据清理，升级后默认关闭，避免按旧默认天数误删历史。
+    #[serde(default)]
+    pub metadata_cleanup_enabled: bool,
     /// 存储空间上限（MB），超过后自动清理最旧的数据
     pub storage_limit_mb: u32,
     /// JPEG 质量 (1-100)
@@ -587,10 +604,11 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             screenshot_retention_days: 7, // 默认保留7天截图
-            metadata_retention_days: 30,  // 默认保留30天元数据
-            storage_limit_mb: 2048,       // 默认2GB上限
-            jpeg_quality: 85,             // 85%质量，更清晰
-            max_image_width: 1280,        // 最大宽度1280px
+            metadata_retention_days: 30,  // 启用自动清理后的默认保留天数
+            metadata_cleanup_enabled: false,
+            storage_limit_mb: 2048, // 默认2GB上限
+            jpeg_quality: 85,       // 85%质量，更清晰
+            max_image_width: 1280,  // 最大宽度1280px
             screenshots_enabled: true,
             screenshot_display_mode: ScreenshotDisplayMode::ActiveWindow,
             screenshot_width_mode: ScreenshotWidthMode::Auto,
@@ -1431,6 +1449,10 @@ impl AppConfig {
         let telegram_bot_bind_code = self.telegram_bot_bind_code.clone();
         let telegram_bot_bind_code_expires_at = self.telegram_bot_bind_code_expires_at;
         let background_image = self.background_image.clone();
+        let metadata_retention = (
+            self.storage.metadata_cleanup_enabled,
+            self.storage.metadata_retention_days,
+        );
 
         *self = remote;
 
@@ -1448,6 +1470,11 @@ impl AppConfig {
         self.telegram_bot_bind_code = telegram_bot_bind_code;
         self.telegram_bot_bind_code_expires_at = telegram_bot_bind_code_expires_at;
         self.background_image = background_image;
+        // 自动删除授权与期限属于本机，远端同步不得开启或缩短本机保留策略。
+        (
+            self.storage.metadata_cleanup_enabled,
+            self.storage.metadata_retention_days,
+        ) = metadata_retention;
     }
 
     /// 规范化配置，兼容旧字段并补齐助手可用的文本模型档案
@@ -2148,11 +2175,79 @@ mod tests {
     use std::io::{self, Write};
     use std::path::PathBuf;
 
+    #[test]
+    fn privacy_extract_domain_normalizes_hosts() {
+        for (input, expected) in [
+            ("https://example.com/path", "example.com"),
+            ("https://example.com:8443/path", "example.com"),
+            (
+                " HTTPS://Sub.Example.COM:8443?query=1#fragment ",
+                "sub.example.com",
+            ),
+            ("example.com", "example.com"),
+            ("Example.COM:8443/path?query=1#fragment", "example.com"),
+            ("example.com?query=1", "example.com"),
+            ("example.com#fragment", "example.com"),
+            (
+                "example.com?next=https://other.com&email=a@b.com",
+                "example.com",
+            ),
+            ("https://WWW.Example.com:8443", "www.example.com"),
+            ("https://Sub.Example.com.:8443/path", "sub.example.com"),
+            ("http://localhost:5173/app", "localhost"),
+            ("127.0.0.1:8080", "127.0.0.1"),
+            ("https://[::1]:8443/path", "[::1]"),
+            ("", ""),
+            ("   ", ""),
+            ("not a host", ""),
+            ("https://", ""),
+            ("https://example.com:invalid/path", ""),
+            ("example.com:99999", ""),
+            ("/example.com/path", ""),
+            ("mailto:user@example.com", ""),
+            ("about:blank", ""),
+            ("file:///tmp/example.com", ""),
+        ] {
+            assert_eq!(
+                super::PrivacyConfig::extract_domain(input),
+                expected,
+                "{input:?}"
+            );
+        }
+    }
+
     fn unique_temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "work-review-config-{name}-{}",
             uuid::Uuid::new_v4()
         ))
+    }
+
+    #[test]
+    fn 元数据自动清理须兼容旧配置且不得经远端同步开启() {
+        let mut legacy = serde_json::to_value(AppConfig::default()).unwrap();
+        legacy["storage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("metadata_cleanup_enabled");
+        let mut local: AppConfig = serde_json::from_value(legacy).unwrap();
+        assert!(!local.storage.metadata_cleanup_enabled);
+        assert_eq!(local.storage.metadata_retention_days, 30);
+        let mut remote = AppConfig::default();
+        remote.storage.metadata_cleanup_enabled = true;
+        remote.storage.metadata_retention_days = 1;
+        local.apply_synced_remote(remote);
+        assert!(!local.storage.metadata_cleanup_enabled);
+        assert_eq!(local.storage.metadata_retention_days, 30);
+        local.storage.metadata_cleanup_enabled = true;
+        local.storage.metadata_retention_days = 90;
+        let restored: AppConfig =
+            serde_json::from_value(serde_json::to_value(&local).unwrap()).unwrap();
+        assert!(restored.storage.metadata_cleanup_enabled);
+        assert_eq!(restored.storage.metadata_retention_days, 90);
+        local.apply_synced_remote(AppConfig::default());
+        assert!(local.storage.metadata_cleanup_enabled);
+        assert_eq!(local.storage.metadata_retention_days, 90);
     }
 
     #[test]

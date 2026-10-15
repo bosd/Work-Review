@@ -1652,8 +1652,10 @@ impl Database {
             "DELETE FROM activities WHERE timestamp < ?1",
             params![upper_ts],
         )?;
-        Self::invalidate_daily_cache(&tx, &dates)?;
-        Self::clear_memory_chunks_and_mark_rebuild_required_on(&tx)?;
+        if deleted > 0 {
+            Self::invalidate_daily_cache(&tx, &dates)?;
+            Self::clear_memory_chunks_and_mark_rebuild_required_on(&tx)?;
+        }
         tx.commit()?;
         Ok(deleted)
     }
@@ -7588,6 +7590,22 @@ mod tests {
             .expect("Unicode 字母数字及安全分隔符应可用");
         assert_eq!(valid.memory_key, "回答风格.v2");
         let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn 无过期活动时定期清理不得清空语义索引() {
+        let (path, db, _, _, date) = seed_activity_deletion_state("retention-noop");
+        assert_eq!(db.delete_activities_before_date(&date).unwrap(), 0);
+        let count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM memory_chunks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "未删除活动时应保留已建好的语义块");
+        assert!(db.get_report(&date, Some("zh-CN")).unwrap().is_some());
+        drop(db);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

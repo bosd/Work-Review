@@ -49,14 +49,6 @@ pub(crate) enum AgentRunError {
 // Agent 执行器 — 核心循环
 // ══════════════════════════════════════════════════════════
 
-fn wrap_deadline(deadline: Deadline, wrap_reserve: Duration) -> Deadline {
-    if deadline.remaining().is_zero() {
-        Deadline::after(wrap_reserve.max(Duration::from_secs(8)))
-    } else {
-        deadline
-    }
-}
-
 /// 默认最大迭代次数
 const DEFAULT_MAX_ITERATIONS: usize = 8;
 
@@ -351,7 +343,8 @@ impl AgentExecutor {
                     &tool_context,
                     tool_labels,
                     &event_tx,
-                    wrap_deadline(deadline, wrap_reserve),
+                    &mut cancel_rx,
+                    deadline,
                 )
                 .await;
             }
@@ -589,7 +582,8 @@ impl AgentExecutor {
             &tool_context,
             tool_labels,
             &event_tx,
-            wrap_deadline(deadline, wrap_reserve),
+            &mut cancel_rx,
+            deadline,
         )
         .await
     }
@@ -597,6 +591,7 @@ impl AgentExecutor {
     /// 收束路径：预算（时长/轮数）耗尽时，禁用工具做最后一次模型调用，
     /// 强制基于已收集的工具结果产出答案；若一次工具都没跑过或收束调用失败，
     /// 退回固定文案。
+    #[allow(clippy::too_many_arguments)]
     async fn wrap_up(
         model_config: &ModelConfig,
         sys: &str,
@@ -604,8 +599,20 @@ impl AgentExecutor {
         tool_context: &super::tools::ToolContext<'_>,
         tool_labels: Vec<String>,
         event_tx: &Option<StreamEventSender>,
+        cancel_rx: &mut Option<tokio::sync::watch::Receiver<bool>>,
         deadline: Deadline,
     ) -> Result<AgentResult, AgentRunError> {
+        ensure_event_receiver_open(event_tx)?;
+        if is_cancelled(cancel_rx) {
+            let references = tool_context.take_all_references();
+            emit_done(event_tx, CANCELLED_ANSWER, &references, &tool_labels).await?;
+            return Ok(AgentResult {
+                answer: CANCELLED_ANSWER.to_string(),
+                tool_labels,
+                references,
+            });
+        }
+
         let fallback = if tool_labels.is_empty() {
             "处理超时，请尝试更具体的问题。".to_string()
         } else {
@@ -627,7 +634,7 @@ impl AgentExecutor {
         ));
 
         let no_tools: Vec<serde_json::Value> = Vec::new();
-        let wrap_result = await_or_event_receiver_closed(event_tx, async {
+        let wrap_result = await_or_cancelled(event_tx, cancel_rx, async {
             if event_tx.is_some() {
                 let mut batcher = TokenBatcher::new();
                 let result = {
@@ -651,8 +658,9 @@ impl AgentExecutor {
         .await?;
 
         let content = match wrap_result {
-            Ok(response) => response.content.unwrap_or(fallback),
-            Err(_) => fallback,
+            AwaitOutcome::Done(Ok(response)) => response.content.unwrap_or(fallback),
+            AwaitOutcome::Done(Err(_)) => fallback,
+            AwaitOutcome::Cancelled => CANCELLED_ANSWER.to_string(),
         };
         let references = tool_context.take_all_references();
         emit_done(event_tx, &content, &references, &tool_labels).await?;
@@ -762,22 +770,6 @@ fn ensure_event_receiver_open(tx: &Option<StreamEventSender>) -> Result<(), Agen
         Err(AgentRunError::EventReceiverClosed)
     } else {
         Ok(())
-    }
-}
-
-/// 同时等待业务 Future 和桥接关闭信号，避免在已确认断开的请求上继续消耗模型或工具。
-async fn await_or_event_receiver_closed<T>(
-    tx: &Option<StreamEventSender>,
-    future: impl Future<Output = T>,
-) -> Result<T, AgentRunError> {
-    if let Some(tx) = tx {
-        tokio::select! {
-            biased;
-            _ = tx.closed() => Err(AgentRunError::EventReceiverClosed),
-            result = future => Ok(result),
-        }
-    } else {
-        Ok(future.await)
     }
 }
 
@@ -1145,7 +1137,7 @@ mod tests {
         let (tx, rx) = StreamEventSender::channel(1);
         let tx = Some(tx);
         let task = tokio::spawn(async move {
-            await_or_event_receiver_closed(&tx, std::future::pending::<()>()).await
+            await_or_cancelled(&tx, &mut None, std::future::pending::<()>()).await
         });
 
         drop(rx);
@@ -1155,6 +1147,82 @@ mod tests {
             .expect("桥接关闭后在途 Future 应及时结束")
             .expect("取消等待任务不应 panic");
         assert!(matches!(result, Err(AgentRunError::EventReceiverClosed)));
+    }
+
+    #[tokio::test]
+    async fn 收束使用的取消等待应能打断在途调用() {
+        for has_events in [false, true] {
+            let (sender, _receiver) = StreamEventSender::channel(1);
+            let event_tx = has_events.then_some(sender);
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let mut cancel_rx = Some(cancel_rx);
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let wait = await_or_cancelled(&event_tx, &mut cancel_rx, async {
+                started_tx.send(()).unwrap();
+                std::future::pending::<()>().await
+            });
+            let cancel = async {
+                started_rx.await.unwrap();
+                cancel_tx.send(true).unwrap();
+            };
+
+            let (outcome, ()) =
+                tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(wait, cancel) })
+                    .await
+                    .expect("收束在途调用必须及时响应停止");
+            assert!(matches!(outcome, Ok(AwaitOutcome::Cancelled)));
+        }
+    }
+
+    #[tokio::test]
+    async fn 收束开始前已取消应返回停止终态而非超时回退() {
+        let database = Database::new(std::path::Path::new(":memory:")).unwrap();
+        let tool_context = super::super::tools::ToolContext {
+            database: &database,
+            ignored_apps: vec![],
+            excluded_domains: vec![],
+            web: None,
+            collected_references: Arc::new(Mutex::new(Vec::new())),
+            runtime: AssistantRuntime::default(),
+        };
+        // 空 endpoint：已取消时不得开始任何模型请求。
+        let mut config = ModelConfig::default_text();
+        config.endpoint.clear();
+        for tool_labels in [vec![], vec!["query_activities".to_string()]] {
+            let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(true);
+            let mut cancel_rx = Some(cancel_rx);
+            let (sender, mut receiver) = StreamEventSender::channel(1);
+            let event_tx = Some(sender);
+            let mut messages = vec![Message::user("收束已有结果")];
+            let wrap = AgentExecutor::wrap_up(
+                &config,
+                "test",
+                &mut messages,
+                &tool_context,
+                tool_labels.clone(),
+                &event_tx,
+                &mut cancel_rx,
+                Deadline::after(Duration::from_secs(10)),
+            );
+            let acknowledge = async {
+                let envelope = receiver.recv().await.expect("应发送停止终态");
+                assert!(matches!(
+                    &envelope.event,
+                    StreamEvent::Done { answer, tool_labels: labels, .. }
+                        if answer == CANCELLED_ANSWER && labels == &tool_labels
+                ));
+                envelope.delivery_ack.unwrap().send(Ok(())).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(wrap, acknowledge)
+            })
+            .await
+            .expect("已取消的收束不应等待模型");
+            let result = result.unwrap();
+            assert_eq!(result.answer, CANCELLED_ANSWER);
+            assert_eq!(result.tool_labels, tool_labels);
+            assert_eq!(messages.len(), 1, "取消后不应追加收束模型提示");
+        }
     }
 
     #[test]

@@ -672,9 +672,10 @@
   }
 
   async function stopCurrentRequest() {
-    if (!activeSendingRequestId) return;
+    const requestId = activeSendingRequestId ?? get(assistantStore).sendingRequestId;
+    if (!requestId) return;
     try {
-      await invoke('cancel_assistant_request', { requestId: activeSendingRequestId });
+      await invoke('cancel_assistant_request', { requestId });
     } catch (e) {
       console.warn('发送停止信号失败:', e);
     }
@@ -786,8 +787,8 @@
         modelName: answer?.modelName ?? m.modelName,
       }));
 
-      // P3：本轮完成 → 持久化（从 store 取终态消息）
-      const finalMessage = (assistantState.messages || []).find(
+      // 切页后组件已解除订阅，必须从 store 读取最新终态，不能使用局部快照。
+      const finalMessage = (get(assistantStore).messages || []).find(
         (m) => m.id === assistantMessageId
       );
       persistRound(convId, trimmed, finalMessage);

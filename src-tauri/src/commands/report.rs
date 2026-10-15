@@ -100,6 +100,114 @@ fn export_daily_report_markdown(
     )))
 }
 
+// JoinHandle 默认在 drop 时分离；父请求取消和超时都必须停止分析器。
+struct AbortReportOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortReportOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn await_report_task<T>(
+    task: tokio::task::JoinHandle<T>,
+    timeout: std::time::Duration,
+) -> Result<Result<T, tokio::task::JoinError>, tokio::time::error::Elapsed> {
+    let _abort = AbortReportOnDrop(task.abort_handle());
+    tokio::time::timeout(timeout, task).await
+}
+
+struct ReportAvatarGuard<'a> {
+    state: &'a Mutex<AppState>,
+    active: bool,
+}
+
+impl<'a> ReportAvatarGuard<'a> {
+    fn start(
+        state: &'a Mutex<AppState>,
+    ) -> Result<(Self, Option<crate::avatar_engine::AvatarStatePayload>), AppError> {
+        let avatar_start_state = {
+            let mut state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
+            // localhost API 没有 command / assistant 的外层 guard，也要避免互相清理标志。
+            if state.avatar_generating_report {
+                return Err(AppError::Unknown("日报正在生成中，请稍候".to_string()));
+            }
+            let avatar_state = crate::avatar_engine::apply_avatar_visual_settings(
+                crate::avatar_engine::derive_avatar_state(
+                    &state.avatar_state.app_name,
+                    "",
+                    None,
+                    state.avatar_state.is_idle,
+                    true,
+                ),
+                state.config.avatar_opacity,
+                &state.config.avatar_preset,
+                &state.config.avatar_persona,
+                state.config.avatar_body_hidden,
+            );
+            let avatar_start_state = state.config.avatar_enabled.then(|| avatar_state.clone());
+            state.avatar_state = avatar_state;
+            state.avatar_generating_report = true;
+            avatar_start_state
+        };
+        Ok((
+            Self {
+                state,
+                active: true,
+            },
+            avatar_start_state,
+        ))
+    }
+
+    fn finish(&mut self) -> Result<Option<crate::avatar_engine::AvatarStatePayload>, AppError> {
+        if !self.active {
+            return Ok(None);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|e| AppError::Unknown(e.to_string()))?;
+        state.avatar_generating_report = false;
+        // 监控循环或配置更新可能已换成暂停等状态，不要用日报收尾覆盖它们。
+        if state.avatar_state.is_generating_report {
+            state.avatar_state = crate::avatar_engine::apply_avatar_visual_settings(
+                crate::avatar_engine::derive_avatar_state(
+                    &state.avatar_state.app_name,
+                    "",
+                    None,
+                    state.avatar_state.is_idle,
+                    false,
+                ),
+                state.config.avatar_opacity,
+                &state.config.avatar_preset,
+                &state.config.avatar_persona,
+                state.config.avatar_body_hidden,
+            );
+        }
+        self.active = false;
+        Ok(state
+            .config
+            .avatar_enabled
+            .then(|| state.avatar_state.clone()))
+    }
+}
+
+impl Drop for ReportAvatarGuard<'_> {
+    fn drop(&mut self) {
+        // 取消也须立即发布复位状态：短任务可能尚未被监控循环观察到。
+        // 只发状态，不发送成功/失败气泡；测试环境没有运行中的 AppHandle。
+        match self.finish() {
+            Ok(Some(avatar_state)) => {
+                if let Some(app) = crate::APP_HANDLE.get() {
+                    crate::avatar_engine::emit_avatar_state(app, &avatar_state);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => log::warn!("清理日报桌宠状态失败: {error}"),
+        }
+    }
+}
+
 /// 生成日报
 pub(crate) async fn generate_report_inner(
     date: String,
@@ -138,29 +246,7 @@ pub(crate) async fn generate_report_inner(
         )
     };
 
-    let avatar_start_state = {
-        let mut state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-        state.avatar_generating_report = true;
-        let avatar_state = crate::avatar_engine::apply_avatar_visual_settings(
-            crate::avatar_engine::derive_avatar_state(
-                &state.avatar_state.app_name,
-                "",
-                None,
-                state.avatar_state.is_idle,
-                true,
-            ),
-            state.config.avatar_opacity,
-            &state.config.avatar_preset,
-            &state.config.avatar_persona,
-            state.config.avatar_body_hidden,
-        );
-        state.avatar_state = avatar_state.clone();
-        if state.config.avatar_enabled {
-            Some(avatar_state)
-        } else {
-            None
-        }
-    };
+    let (mut avatar_guard, avatar_start_state) = ReportAvatarGuard::start(state)?;
 
     if let Some(avatar_state) = avatar_start_state.as_ref() {
         crate::avatar_engine::emit_avatar_state(app, avatar_state);
@@ -198,7 +284,7 @@ pub(crate) async fn generate_report_inner(
     );
 
     // 生成报告（spawn 隔离 panic，防止内部错误杀死整个 tokio 线程）
-    // 外层超时可配置（默认 300 秒），到期 abort 后台任务。
+    // 外层超时可配置（默认 300 秒），超时或父 Future 取消都会 abort 后台任务。
     let screenshots_dir = data_dir.clone();
     let date_gen = date.clone();
     let category_name_overrides: std::collections::HashMap<String, String> = config
@@ -224,9 +310,7 @@ pub(crate) async fn generate_report_inner(
             )
             .await
     });
-    let abort = spawn_result.abort_handle();
-
-    let report_result = match tokio::time::timeout(report_timeout, spawn_result).await {
+    let report_result = match await_report_task(spawn_result, report_timeout).await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => Err(work_review_core::error::AppError::Analysis(
             match report_locale {
@@ -240,46 +324,19 @@ pub(crate) async fn generate_report_inner(
                 }
             },
         )),
-        Err(_) => {
-            abort.abort();
-            Err(work_review_core::error::AppError::Analysis(
-                match report_locale {
-                    AppLocale::ZhCn => "日报生成超时，请稍后重试".to_string(),
-                    AppLocale::ZhTw => "日報生成逾時，請稍後重試".to_string(),
-                    AppLocale::En => {
-                        "Report generation timed out, please try again later".to_string()
-                    }
-                    AppLocale::Ar => {
-                        "انتهت مهلة إنشاء التقرير، يرجى المحاولة مرة أخرى لاحقاً".to_string()
-                    }
-                },
-            ))
-        }
+        Err(_) => Err(work_review_core::error::AppError::Analysis(
+            match report_locale {
+                AppLocale::ZhCn => "日报生成超时，请稍后重试".to_string(),
+                AppLocale::ZhTw => "日報生成逾時，請稍後重試".to_string(),
+                AppLocale::En => "Report generation timed out, please try again later".to_string(),
+                AppLocale::Ar => {
+                    "انتهت مهلة إنشاء التقرير، يرجى المحاولة مرة أخرى لاحقاً".to_string()
+                }
+            },
+        )),
     };
 
-    let avatar_finish_state = {
-        let mut state = state.lock().map_err(|e| AppError::Unknown(e.to_string()))?;
-        state.avatar_generating_report = false;
-        let avatar_state = crate::avatar_engine::apply_avatar_visual_settings(
-            crate::avatar_engine::derive_avatar_state(
-                &state.avatar_state.app_name,
-                "",
-                None,
-                state.avatar_state.is_idle,
-                false,
-            ),
-            state.config.avatar_opacity,
-            &state.config.avatar_preset,
-            &state.config.avatar_persona,
-            state.config.avatar_body_hidden,
-        );
-        state.avatar_state = avatar_state.clone();
-        if state.config.avatar_enabled {
-            Some(avatar_state)
-        } else {
-            None
-        }
-    };
+    let avatar_finish_state = avatar_guard.finish()?;
 
     if let Some(avatar_state) = avatar_finish_state.as_ref() {
         crate::avatar_engine::emit_avatar_state(app, avatar_state);
@@ -733,6 +790,172 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use work_review_core::config::AiMode;
+
+    // 只构造内存状态，不启动 Tauri、截图、后台服务或模型请求。
+    fn report_test_state() -> Arc<Mutex<AppState>> {
+        let config = AppConfig::default();
+        let data_dir = std::env::temp_dir().join(format!("report-test-{}", uuid::Uuid::new_v4()));
+        Arc::new(Mutex::new(AppState {
+            config_load_status: work_review_core::config::ConfigLoadStatus::Loaded,
+            database: work_review_core::database::Database::new(Path::new(":memory:")).unwrap(),
+            privacy_filter: work_review_core::privacy::PrivacyFilter::from_config(&config.privacy),
+            screenshot_service: crate::screenshot::ScreenshotService::new(
+                &data_dir,
+                &config.storage,
+            ),
+            storage_manager: crate::storage::StorageManager::new(&data_dir, config.storage.clone()),
+            config,
+            config_path: data_dir.join("config.json"),
+            data_dir,
+            is_recording: false,
+            is_paused: false,
+            avatar_state: crate::avatar_engine::default_avatar_state(),
+            avatar_generating_report: false,
+            generating_report: false,
+            localhost_api_runtime: Default::default(),
+            telegram_bot_runtime: Default::default(),
+            wecom_bot_runtime: Default::default(),
+            cached_active_window: None,
+        }))
+    }
+
+    struct SignalOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for SignalOnDrop {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn 取消父请求应停止分析器并清理内外生成标志() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::oneshot;
+        use tokio::time::{timeout, Duration};
+
+        let state = report_test_state();
+        state.lock().unwrap().generating_report = true;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let child_calls = calls.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (proceed_tx, proceed_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let mut parent = Box::pin(async {
+            // 与 command / assistant 一样，外层 guard 在共享 Future 被取消后释放。
+            let _outer_guard = ReportGenerationGuard {
+                state: state.clone(),
+            };
+            let (_avatar_guard, _) = ReportAvatarGuard::start(&state).unwrap();
+            await_report_task(
+                tokio::spawn(async move {
+                    let _dropped = SignalOnDrop(Some(dropped_tx));
+                    let _ = started_tx.send(());
+                    let _ = proceed_rx.await;
+                    child_calls.fetch_add(1, Ordering::SeqCst); // 模拟下一次模型请求
+                }),
+                Duration::from_secs(60),
+            )
+            .await
+        });
+        timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                result = &mut parent => panic!("父请求不应提前结束: {result:?}"),
+                started = started_rx => started.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.lock().unwrap().avatar_generating_report);
+        drop(parent);
+        {
+            let state = state.lock().unwrap();
+            assert!(!state.generating_report);
+            assert!(!state.avatar_generating_report);
+            assert!(!state.avatar_state.is_generating_report);
+        }
+        let _ = proceed_tx.send(());
+        timeout(Duration::from_secs(2), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn 超时也应停止分析器且正常结果和_panic_仍可区分() {
+        use tokio::sync::oneshot;
+        use tokio::time::{timeout, Duration};
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _dropped = SignalOnDrop(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(await_report_task(task, Duration::ZERO).await.is_err());
+        timeout(Duration::from_secs(2), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            await_report_task(
+                tokio::spawn(async { Ok::<_, &str>("report") }),
+                Duration::from_secs(2)
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            Ok("report")
+        );
+        assert_eq!(
+            await_report_task(
+                tokio::spawn(async { Err::<(), _>("analysis failed") }),
+                Duration::from_secs(2)
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            Err("analysis failed")
+        );
+        assert!(await_report_task(
+            tokio::spawn(async { panic!("analyzer panic") }),
+            Duration::from_secs(2)
+        )
+        .await
+        .unwrap()
+        .unwrap_err()
+        .is_panic());
+    }
+
+    #[test]
+    fn 头像收尾不覆盖新状态且旧_guard_不清理下一次生成() {
+        let state = report_test_state();
+        let (mut guard, _) = ReportAvatarGuard::start(&state).unwrap();
+        // 共享层也拦截 localhost 等入口的重复生成，失败不能清理现有任务。
+        assert!(ReportAvatarGuard::start(&state).is_err());
+        assert!(state.lock().unwrap().avatar_generating_report);
+        let newer_state = crate::avatar_engine::default_avatar_state();
+        state.lock().unwrap().avatar_state = newer_state.clone();
+        guard.finish().unwrap();
+        assert_eq!(state.lock().unwrap().avatar_state, newer_state);
+        assert!(!state.lock().unwrap().avatar_generating_report);
+
+        let (next_guard, _) = ReportAvatarGuard::start(&state).unwrap();
+        drop(guard);
+        assert!(state.lock().unwrap().avatar_generating_report);
+        state.lock().unwrap().avatar_state = newer_state.clone();
+        drop(next_guard);
+        assert_eq!(state.lock().unwrap().avatar_state, newer_state);
+        assert!(!state.lock().unwrap().avatar_generating_report);
+    }
 
     #[test]
     fn summary回退到基础模板时不应保留_ai_模型标签() {

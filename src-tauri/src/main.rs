@@ -1422,6 +1422,24 @@ fn should_run_ocr(elapsed_since_ocr: Option<Duration>, screenshot_interval: u64)
     }
 }
 
+/// 浮窗只合并连续观察到的同一条记录，并保留不足一秒的余量。
+fn overlay_session_increment(
+    previous: Option<(i64, std::time::Instant)>,
+    latest: &work_review_core::database::Activity,
+    now: std::time::Instant,
+    timestamp: i64,
+) -> Option<(i64, std::time::Instant)> {
+    let (activity_id, accounted_at) = previous?;
+    if latest.id != Some(activity_id)
+        || latest.app_name == "Unknown"
+        || !(0..=600).contains(&timestamp.saturating_sub(latest.timestamp))
+    {
+        return None;
+    }
+    let seconds = now.checked_duration_since(accounted_at)?.as_secs();
+    Some((seconds as i64, accounted_at + Duration::from_secs(seconds)))
+}
+
 fn monitoring_poll_interval_ms_for_platform(is_macos: bool) -> u64 {
     if is_macos {
         1500
@@ -2156,6 +2174,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
     let mut last_browser_url: Option<String> = None;
 
     let mut last_capture_time = std::time::Instant::now();
+    let mut overlay_sessions = std::collections::HashMap::new();
 
     // ===== 空闲检测器 =====
     // 先以输入空闲进入”疑似空闲”，再结合前台变化做短时保留。
@@ -2197,6 +2216,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
 
         if decision.reset_capture_clock {
             last_capture_time = std::time::Instant::now();
+            overlay_sessions.clear();
         }
 
         if !decision.should_continue {
@@ -2215,6 +2235,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
         if cached_screen_locked {
             log::info!("🔒 屏幕已锁定，暂停活动统计");
             last_app_name = None; // 重置应用状态，解锁后视为新开始
+            overlay_sessions.clear();
             last_capture_time = std::time::Instant::now(); // 重置截图计时，避免解锁后累加锁屏时长
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
@@ -2255,6 +2276,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                         Ok(w) => w,
                         Err(_) => {
                             last_capture_time = std::time::Instant::now();
+                            overlay_sessions.clear();
                             continue;
                         }
                     },
@@ -2273,6 +2295,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
         };
 
         if !should_capture {
+            overlay_sessions.clear();
             continue;
         }
 
@@ -2286,6 +2309,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                 last_app_window_title = None;
                 last_browser_url = None;
                 last_capture_time = std::time::Instant::now();
+                overlay_sessions.clear();
                 continue;
             }
         }
@@ -2304,6 +2328,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                 last_app_window_title = None;
                 last_browser_url = None;
                 last_capture_time = std::time::Instant::now();
+                overlay_sessions.clear();
                 continue;
             }
         }
@@ -3311,8 +3336,15 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
         // ===== 浮动窗口（PiP 画中画）检测 =====
         // 检测 layer > 0 的浮动窗口（如视频小窗），为它们记录使用时长
         // 浮动窗口不截图（截图已由主活动管理），仅记录时长
+        // ponytail: 按截图周期采样，短于一个周期的浮窗不估算时长；需要精确计时再独立高频采样。
         let overlay_windows = monitor::get_overlay_windows(&frontmost_app_name);
+        let observed_at = std::time::Instant::now();
+        let mut next_overlay_sessions = std::collections::HashMap::new();
         for ow in &overlay_windows {
+            // 同一应用可能有多个不相邻的浮窗，每轮只能计时一次。
+            if next_overlay_sessions.contains_key(&ow.app_name) {
+                continue;
+            }
             // 隐私检查
             let ow_privacy = {
                 let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -3344,7 +3376,6 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
             };
             let ow_category = classification.base_category.clone();
             let current_ts = chrono::Local::now().timestamp();
-            let ow_duration = poll_interval_ms.div_ceil(1000) as i64;
 
             // 查找该应用的最近活动记录，尝试合并
             let latest = {
@@ -3356,16 +3387,22 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                     .flatten()
             };
 
-            const OW_MERGE_GAP_SECS: i64 = 600;
-            let can_merge = if let Some(ref act) = latest {
-                ow.app_name != "Unknown" && (current_ts - act.timestamp) <= OW_MERGE_GAP_SECS
-            } else {
-                false
-            };
+            let increment = latest.as_ref().and_then(|activity| {
+                overlay_session_increment(
+                    overlay_sessions.get(&ow.app_name).copied(),
+                    activity,
+                    observed_at,
+                    current_ts,
+                )
+            });
 
-            if can_merge {
+            if let Some((ow_duration, accounted_at)) = increment {
                 let act = latest.unwrap();
                 if let Some(act_id) = act.id {
+                    if ow_duration == 0 {
+                        next_overlay_sessions.insert(ow.app_name.clone(), (act_id, accounted_at));
+                        continue;
+                    }
                     let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
                     match state_guard.database.merge_activity(
                         act_id,
@@ -3376,6 +3413,8 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                         None,
                     ) {
                         Ok(_) => {
+                            next_overlay_sessions
+                                .insert(ow.app_name.clone(), (act_id, accounted_at));
                             log::info!(
                                 "🪟 浮动窗口合并: {} (id={}, +{}s, 总{}s)",
                                 ow.app_name,
@@ -3388,12 +3427,14 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                     }
                 }
             } else {
-                // 新建活动记录（无截图）
+                // 首次观察不能反推浮窗何时出现，先以 0 秒创建连续会话。
+                let ow_duration = 0;
                 let ow_title = if ow_privacy == work_review_core::privacy::PrivacyAction::Anonymize
                 {
                     "[内容已脱敏]".to_string()
                 } else {
-                    ow.window_title.clone()
+                    let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                    state_guard.privacy_filter.filter_text(&ow.window_title)
                 };
 
                 let activity = work_review_core::database::Activity {
@@ -3415,6 +3456,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                 let state_guard = state.lock().unwrap_or_else(|e| e.into_inner());
                 match state_guard.database.insert_activity(&activity) {
                     Ok(id) => {
+                        next_overlay_sessions.insert(ow.app_name.clone(), (id, observed_at));
                         log::info!(
                             "🪟 浮动窗口新建: {} (id={}, {}s)",
                             ow.app_name,
@@ -3426,6 +3468,7 @@ async fn background_screenshot_task(state: Arc<Mutex<AppState>>, app: AppHandle)
                 }
             }
         }
+        overlay_sessions = next_overlay_sessions;
     }
 }
 
@@ -4005,10 +4048,11 @@ async fn storage_cleanup_task(state: Arc<Mutex<AppState>>) {
         // 启动清理已在 main 里执行过,首轮直接等一个周期
         tokio::time::sleep(tokio::time::Duration::from_secs(SWEEP_INTERVAL_SECS)).await;
 
-        let (data_dir, storage_config, allowed) = {
+        let (data_dir, database, storage_config, allowed) = {
             let guard = state.lock().unwrap_or_else(|e| e.into_inner());
             (
                 guard.data_dir.clone(),
+                guard.database.clone(),
                 guard.config.storage.clone(),
                 should_run_startup_cleanup(guard.config_load_status),
             )
@@ -4019,7 +4063,7 @@ async fn storage_cleanup_task(state: Arc<Mutex<AppState>>) {
 
         // 用独立实例在阻塞线程执行,避免清理期间占用 AppState 锁阻塞采集循环
         let manager = StorageManager::new(&data_dir, storage_config);
-        match tokio::task::spawn_blocking(move || manager.cleanup()).await {
+        match tokio::task::spawn_blocking(move || manager.cleanup(&database)).await {
             Ok(Ok(_)) => log::debug!("周期存储清理完成"),
             Ok(Err(e)) => log::warn!("周期存储清理失败: {e}"),
             Err(e) => log::warn!("周期存储清理任务异常: {e}"),
@@ -4225,7 +4269,7 @@ async fn main() {
 
     // 配置损坏时使用默认存储策略会误删历史数据，因此故障安全启动必须跳过清理。
     if should_run_startup_cleanup(config_load_status) {
-        if let Err(e) = storage_manager.cleanup() {
+        if let Err(e) = storage_manager.cleanup(&database) {
             log::warn!("启动时清理存储失败: {e}");
         }
     } else {
@@ -4766,9 +4810,10 @@ mod tests {
         browser_url_probe_attempted_after_full_lookup, describe_config_file_issue,
         duplicate_instance_should_stay_silent, effective_dock_visibility, initial_recording_state,
         launch_args_contain_autostart, main_window_close_behavior, monitoring_poll_interval_ms,
-        monitoring_poll_interval_ms_for_platform, persist_previous_activity_backfill,
-        previous_app_backfill_duration, record_avatar_window_switch, recording_loop_decision,
-        resolve_activity_classification, resolve_browser_url_once, reusable_cached_active_window,
+        monitoring_poll_interval_ms_for_platform, overlay_session_increment,
+        persist_previous_activity_backfill, previous_app_backfill_duration,
+        record_avatar_window_switch, recording_loop_decision, resolve_activity_classification,
+        resolve_browser_url_once, reusable_cached_active_window,
         screen_lock_check_interval_ms_for_platform, should_confirm_idle,
         should_emit_avatar_backlog_nudge, should_hide_main_window_on_setup,
         should_initialize_avatar_input, should_initialize_startup_permissions,
@@ -4847,6 +4892,66 @@ mod tests {
         assert!(decision.should_continue);
         assert!(!decision.reset_capture_clock);
         assert_eq!(decision.screenshot_interval, 30);
+    }
+
+    #[test]
+    fn 浮窗应按实际连续观察间隔计时且不得跨会话合并() {
+        let start = Instant::now();
+        let mut activity = work_review_core::database::Activity {
+            id: Some(7),
+            timestamp: 1000,
+            app_name: "Player".into(),
+            window_title: "PiP".into(),
+            screenshot_path: String::new(),
+            ocr_text: None,
+            category: "entertainment".into(),
+            duration: 0,
+            browser_url: None,
+            executable_path: None,
+            semantic_category: None,
+            semantic_confidence: None,
+            screenshot_url: None,
+        };
+        let sample = start + Duration::from_millis(30_500);
+        assert_eq!(
+            overlay_session_increment(None, &activity, sample, 1030),
+            None
+        );
+        assert_eq!(
+            overlay_session_increment(Some((7, start)), &activity, sample, 1030),
+            Some((30, start + Duration::from_secs(30)))
+        );
+        // 30.5 秒后的半秒余量不得被每轮舍弃：再过 1.5 秒应追加 2 秒。
+        activity.timestamp = 1030;
+        assert_eq!(
+            overlay_session_increment(
+                Some((7, start + Duration::from_secs(30))),
+                &activity,
+                start + Duration::from_secs(32),
+                1032
+            ),
+            Some((2, start + Duration::from_secs(32)))
+        );
+        // 前台记录取代了上一次浮窗记录、长时间断开、系统时钟倒退都须新建会话。
+        activity.id = Some(8);
+        assert_eq!(
+            overlay_session_increment(Some((7, start)), &activity, sample, 1030),
+            None
+        );
+        activity.id = Some(7);
+        assert_eq!(
+            overlay_session_increment(Some((7, start)), &activity, sample, 1631),
+            None
+        );
+        assert_eq!(
+            overlay_session_increment(Some((7, start)), &activity, sample, 1029),
+            None
+        );
+        activity.app_name = "Unknown".into();
+        assert_eq!(
+            overlay_session_increment(Some((7, start)), &activity, sample, 1030),
+            None
+        );
     }
 
     #[test]

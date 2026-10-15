@@ -10,6 +10,8 @@
   interface ScreenshotStorageSettings {
     screenshots_enabled: boolean;
     screenshot_retention_days: number;
+    metadata_cleanup_enabled: boolean;
+    metadata_retention_days: number;
     screenshot_display_mode: string;
     screenshot_width_mode: string;
     max_image_width: number;
@@ -101,6 +103,7 @@
   }>();
   $: currentLocale = $locale;
   let isClearing = false;
+  let isConfirmingMetadataCleanup = false;
   let isMigrating = false;
   let isCleaningPreviousDir = false;
   let cleanupCandidateDir = '';
@@ -138,6 +141,27 @@
     cache.clear();
     showToast(t('settingsStorage.clearCacheAction'));
     dispatch('clearCache');
+  }
+
+  async function toggleMetadataCleanup() {
+    if (isConfirmingMetadataCleanup) return;
+    if (config.storage.metadata_cleanup_enabled) {
+      config.storage.metadata_cleanup_enabled = false;
+      handleChange();
+      return;
+    }
+    isConfirmingMetadataCleanup = true;
+    try {
+      const confirmed = await ask(t('settingsStorage.metadataCleanupConfirm'), {
+        title: t('settingsStorage.metadataCleanup'),
+        kind: 'warning',
+      });
+      if (!confirmed) return;
+      config.storage.metadata_cleanup_enabled = true;
+      handleChange();
+    } finally {
+      isConfirmingMetadataCleanup = false;
+    }
   }
 
   async function clearOldData() {
@@ -443,6 +467,45 @@
           <span>{t('settingsStorage.retentionMin')}</span>
           <span>{t('settingsStorage.retentionMax')}</span>
         </div>
+      {/if}
+    </div>
+
+    <div class="settings-block">
+      <div class="settings-row">
+        <div>
+          <span class="settings-text">{t('settingsStorage.metadataCleanup')}</span>
+          <p class="settings-muted mt-0.5">{t('settingsStorage.metadataCleanupHint')}</p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-label={t('settingsStorage.metadataCleanup')}
+          aria-checked={Boolean(config.storage.metadata_cleanup_enabled)}
+          disabled={isConfirmingMetadataCleanup}
+          on:click={toggleMetadataCleanup}
+          class="switch-track {config.storage.metadata_cleanup_enabled ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-[#484f58]'}"
+        >
+          <span class="switch-thumb {config.storage.metadata_cleanup_enabled ? 'translate-x-5' : 'translate-x-0'}"></span>
+        </button>
+      </div>
+      {#if config.storage.metadata_cleanup_enabled}
+        <div class="mt-3 flex items-center justify-between gap-3">
+          <label for="metadata-retention-days" class="settings-text">{t('settingsStorage.metadataRetentionDays')}</label>
+          <input
+            id="metadata-retention-days"
+            type="number"
+            min="0"
+            max="9999"
+            step="1"
+            bind:value={config.storage.metadata_retention_days}
+            on:change={() => {
+              config.storage.metadata_retention_days = Math.max(0, Math.min(9999, Math.trunc(Number(config.storage.metadata_retention_days) || 0)));
+              handleChange();
+            }}
+            class="w-20 rounded-md border border-slate-200 bg-white px-2 py-1 text-center text-sm dark:border-[#484f58] dark:bg-[#21262d]"
+          />
+        </div>
+        <p class="settings-muted mt-1">{t('settingsStorage.metadataRetentionHint')}</p>
       {/if}
     </div>
 

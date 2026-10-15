@@ -342,22 +342,86 @@ mod tests {
         config.excluded_domains = vec!["example.com".to_string()];
         let filter = PrivacyFilter::from_config(&config);
 
-        // 精确与子域名后缀命中(与统计侧 matches_excluded_domain 同语义)
+        let collected = config.collect_excluded_domains();
+        for url in [
+            "https://example.com/page",
+            "https://example.com:8443/path",
+            "https://sub.example.com:8443/path",
+            " HTTPS://WWW.Example.COM:8443?query=1#fragment ",
+            "example.com",
+            "Sub.Example.COM:8443/path",
+            "example.com?query=1",
+            "example.com#fragment",
+            "example.com?next=https://other.com&email=a@b.com",
+        ] {
+            assert!(
+                matches_excluded_domain(url, &config.excluded_domains),
+                "{url}"
+            );
+            assert!(matches_excluded_domain(url, &collected), "{url}");
+            assert_eq!(
+                filter.check_privacy_full("Chrome", "Page", Some(url)),
+                PrivacyAction::Skip,
+                "{url}"
+            );
+        }
+        // URL 排除的 Skip 仍优先于窗口标题触发的 Anonymize。
         assert_eq!(
-            filter.check_url_privacy(Some("https://example.com/page")),
+            filter.check_privacy_full("Chrome", "Login", Some("https://example.com:8443")),
             PrivacyAction::Skip
         );
+        for url in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("https://"),
+            Some("not a host"),
+            Some("https://other.com"),
+            Some("https://example.com.evil:8443/path"),
+            Some("https://notexample.com:8443/path"),
+            Some("https://example.com@evil.com:8443/path"),
+            Some("https://evil.com/?next=example.com#example.com"),
+        ] {
+            assert_eq!(
+                filter.check_privacy_full("Chrome", "Page", url),
+                PrivacyAction::Record,
+                "{url:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn privacy_domain_rules_use_the_same_host_normalization() {
+        let config = PrivacyConfig {
+            excluded_domains: vec![
+                " HTTPS://Example.COM:8443/path?query=1#fragment ".to_string(),
+                " ".to_string(),
+                "https://".to_string(),
+            ],
+            ..PrivacyConfig::default()
+        };
+        let collected = config.collect_excluded_domains();
+        assert_eq!(collected, vec!["example.com"]);
+        let filter = PrivacyFilter::from_config(&config);
         assert_eq!(
-            filter.check_url_privacy(Some("https://sub.example.com/page")),
+            filter.check_privacy_full("Chrome", "Page", Some("sub.example.com:9443")),
             PrivacyAction::Skip
         );
-        // 未命中与空值照常记录
-        assert_eq!(
-            filter.check_url_privacy(Some("https://other.com")),
-            PrivacyAction::Record
-        );
-        assert_eq!(filter.check_url_privacy(None), PrivacyAction::Record);
-        assert_eq!(filter.check_url_privacy(Some("")), PrivacyAction::Record);
+        assert!(matches_excluded_domain("sub.example.com:9443", &collected));
+        // 保留子域方向与 www 标签，不把特定子域规则扩大到父域。
+        assert!(!matches_excluded_domain(
+            "example.com",
+            &["www.example.com".to_string()]
+        ));
+        assert!(!matches_excluded_domain(
+            "example.com",
+            &[String::new(), "https://".to_string()]
+        ));
+        // OCR 合并域名兼容语义保持不变。
+        assert!(matches_excluded_domain(
+            "linux.dolatest",
+            &["linux.do".to_string()]
+        ));
     }
 
     #[test]

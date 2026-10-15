@@ -2,7 +2,8 @@ use chrono::{Duration, Local, NaiveDate};
 use std::fs;
 use std::path::{Path, PathBuf};
 use work_review_core::config::StorageConfig;
-use work_review_core::error::Result;
+use work_review_core::database::Database;
+use work_review_core::error::{AppError, Result};
 
 /// 递归遍历目录（替代 walkdir）
 fn walk_dir_recursive(dir: &Path) -> Vec<PathBuf> {
@@ -42,7 +43,10 @@ impl StorageManager {
     }
 
     /// 执行清理任务
-    pub fn cleanup(&self) -> Result<CleanupResult> {
+    pub fn cleanup(&self, database: &Database) -> Result<CleanupResult> {
+        // 元数据清理须由用户显式开启；先完成数据库事务，失败时不继续删文件。
+        self.cleanup_old_metadata(database)?;
+
         // 1. 清理过期的截图文件
         let mut screenshots_deleted = self.cleanup_old_screenshots()?;
 
@@ -68,6 +72,24 @@ impl StorageManager {
             screenshots_deleted,
             total_size_mb,
         })
+    }
+
+    fn cleanup_old_metadata(&self, database: &Database) -> Result<usize> {
+        if !self.config.metadata_cleanup_enabled || self.config.metadata_retention_days == 0 {
+            return Ok(0);
+        }
+        let cutoff = Local::now()
+            .date_naive()
+            .checked_sub_days(chrono::Days::new(u64::from(
+                self.config.metadata_retention_days,
+            )))
+            .ok_or_else(|| AppError::Config("元数据保留天数超出有效范围".to_string()))?;
+        let deleted =
+            database.delete_activities_before_date(&cutoff.format("%Y-%m-%d").to_string())?;
+        if deleted > 0 {
+            log::info!("已清理 {cutoff} 之前的 {deleted} 条活动元数据及关联摘要");
+        }
+        Ok(deleted)
     }
 
     /// 清理过期截图
@@ -274,4 +296,80 @@ pub struct StorageStats {
     pub total_size_mb: f64,
     pub storage_limit_mb: u32,
     pub retention_days: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use work_review_core::database::Activity;
+
+    #[test]
+    fn 元数据清理须显式开启且保留边界日期与永久保留数据() {
+        let dir =
+            std::env::temp_dir().join(format!("work-review-retention-{}", uuid::Uuid::new_v4()));
+        let db = Database::new(&dir.join("test.db")).unwrap();
+        let cutoff = Local::now().date_naive() - Duration::days(30);
+        let boundary = Local
+            .from_local_datetime(&cutoff.and_hms_opt(0, 0, 0).unwrap())
+            .earliest()
+            .unwrap()
+            .timestamp();
+        let insert = |timestamp| {
+            db.insert_activity(&Activity {
+                id: None,
+                timestamp,
+                app_name: "Editor".into(),
+                window_title: "Private project".into(),
+                screenshot_path: String::new(),
+                ocr_text: Some("Private OCR".into()),
+                category: "development".into(),
+                duration: 1,
+                browser_url: Some("https://example.org".into()),
+                executable_path: None,
+                semantic_category: None,
+                semantic_confidence: None,
+                screenshot_url: None,
+            })
+            .unwrap()
+        };
+        let old_id = insert(boundary - 1);
+        let boundary_id = insert(boundary);
+        let recent_id = insert(Local::now().timestamp());
+        let mut config = StorageConfig::default();
+        let mut manager = StorageManager::new(&dir, config.clone());
+
+        manager.cleanup(&db).unwrap();
+        assert!(
+            db.get_activity_by_id(old_id).unwrap().is_some(),
+            "升级后默认不得自动删除历史"
+        );
+        config.metadata_cleanup_enabled = true;
+        config.metadata_retention_days = 0;
+        manager.update_config(config.clone());
+        manager.cleanup(&db).unwrap();
+        assert!(
+            db.get_activity_by_id(old_id).unwrap().is_some(),
+            "0 表示永久保留"
+        );
+
+        config.metadata_retention_days = u32::MAX;
+        manager.update_config(config.clone());
+        assert!(
+            manager.cleanup(&db).is_err(),
+            "非法保留天数应安全失败，不得误删或panic"
+        );
+        assert!(db.get_activity_by_id(old_id).unwrap().is_some());
+
+        config.metadata_retention_days = 30;
+        manager.update_config(config);
+        manager.cleanup(&db).unwrap();
+        assert!(db.get_activity_by_id(old_id).unwrap().is_none());
+        assert!(db.get_activity_by_id(boundary_id).unwrap().is_some());
+        assert!(db.get_activity_by_id(recent_id).unwrap().is_some());
+        manager.cleanup(&db).unwrap();
+        assert!(db.get_activity_by_id(recent_id).unwrap().is_some());
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

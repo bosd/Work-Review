@@ -12,10 +12,10 @@ use work_review_core::config::{AiProvider, ModelConfig};
 use work_review_core::error::AppError;
 use work_review_core::generation_params;
 
-/// 非流式共享 HTTP 客户端（整体 60s / 连接 10s 超时）。
+/// 非流式共享 HTTP 客户端（连接 10s；完整请求受调用方绝对 deadline 限制）。
 /// 进程内复用连接池，避免每次模型调用都重建客户端与 TLS 连接。
 static CHAT_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-/// 流式共享 HTTP 客户端：只限连接超时，读取由逐块 idle + 总时长双护栏控制。
+/// 流式共享 HTTP 客户端：连接 10s；请求 deadline + 逐块 idle 双护栏。
 static STREAM_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn chat_client() -> Result<&'static reqwest::Client, AppError> {
@@ -47,6 +47,9 @@ async fn send_until(
     if deadline.is_expired() {
         return Err(AppError::Analysis("助手请求已超时".to_string()));
     }
+    // reqwest 请求级 timeout 从连接持续到响应体读完，不止响应头。
+    // 每次发送（含重试/回退）只用同一绝对 deadline 的剩余时间，覆盖 json/text/error body。
+    let request = request.timeout(deadline.remaining());
     tokio::time::timeout(deadline.remaining(), request.send())
         .await
         .map_err(|_| AppError::Analysis("等待模型响应头超时".to_string()))?
@@ -775,8 +778,8 @@ fn parse_gemini_response(result: &Value) -> Result<LlmResponse, AppError> {
 //   + 一个 HTTP 驱动（chunk 循环 + 行缓冲 + 喂装配器 + 文本增量回调）。
 // - 入口 chat_with_tools_streaming 与 chat_with_tools 同参，多一个 on_text 回调；
 //   流式路径任何失败都回退到既有非流式实现，保证不比旧行为差。
-// - 超时策略：流式不用整体 HTTP timeout（长答案会被掐断），改为逐块空闲
-//   最多 30s，且与非流式共用调用方传入的绝对 deadline。
+// - 超时策略：请求全过程共用调用方传入的绝对 deadline；流式读取额外限制
+//   逐块空闲最多 30s，不因重试或回退重置总预算。
 
 /// 文本增量回调。executor 层把增量批量合并成 StreamEvent::Token 推给前端。
 pub type OnTextDelta<'a> = &'a mut (dyn FnMut(&str) + Send);
@@ -793,7 +796,7 @@ pub async fn chat_with_tools_streaming(
     on_text: OnTextDelta<'_>,
     deadline: Deadline,
 ) -> Result<LlmResponse, AppError> {
-    // 流式客户端：只限制连接超时，读取超时由逐块 idle 超时控制。
+    // 流式客户端复用连接池；发送时设置剩余 deadline，读取另有逐块 idle 超时。
     let client = stream_client()?;
 
     let mut full_messages = vec![json!({
@@ -1571,6 +1574,100 @@ async fn chat_gemini_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_test_headers(socket: &mut tokio::net::TcpStream) {
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(socket.read_u8().await.unwrap());
+            assert!(headers.len() <= 8192, "本地测试请求头过大");
+        }
+    }
+
+    /// 只绑定回环地址；响应头及部分 body 发完后保持连接，不结束响应体。
+    async fn stalled_body_server(
+        status: &'static str,
+        retry_first: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            if retry_first {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_test_headers(&mut socket).await;
+                socket
+                    .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_test_headers(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{{"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        (endpoint, server)
+    }
+
+    #[tokio::test]
+    async fn 响应头之后的json和错误body读取不得超过截止() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for case in ["json", "text", "stream_error"] {
+            let status = if case == "json" {
+                "200 OK"
+            } else {
+                "400 Bad Request"
+            };
+            let (endpoint, server) = stalled_body_server(status, false).await;
+            let deadline = Deadline::after(Duration::from_millis(150));
+            let response = send_until(client.get(&endpoint), deadline)
+                .await
+                .expect("本地服务应立即返回响应头");
+            let result = tokio::time::timeout(Duration::from_secs(1), async {
+                match case {
+                    "json" => {
+                        let error = response.json::<Value>().await.unwrap_err();
+                        assert!(error.is_timeout(), "JSON 应受请求 deadline 限制: {error}");
+                    }
+                    "text" => {
+                        let error = response.text().await.unwrap_err();
+                        assert!(
+                            error.is_timeout(),
+                            "错误文本应受请求 deadline 限制: {error}"
+                        );
+                    }
+                    _ => assert!(ensure_stream_status(response, "local").await.is_err()),
+                }
+            })
+            .await;
+            server.abort();
+            result.expect("响应头后的 body 卡住不能绕过 deadline");
+            assert!(deadline.is_expired(), "不应在 body 未完成时提前返回");
+        }
+    }
+
+    #[tokio::test]
+    async fn 重试后的响应体仍应消费原截止预算() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (endpoint, server) = stalled_body_server("200 OK", true).await;
+        // 2 秒重试等待后只剩 400ms；第二次请求不得重新获得完整预算。
+        let deadline = Deadline::after(Duration::from_millis(2400));
+        let result = tokio::time::timeout(Duration::from_millis(3000), async {
+            let response = send_with_retry(client.get(&endpoint), deadline)
+                .await
+                .unwrap();
+            assert!(response.status().is_success(), "应已进入第二次请求");
+            let error = response.json::<Value>().await.unwrap_err();
+            assert!(error.is_timeout(), "重试后的 body 应按原截止超时: {error}");
+        })
+        .await;
+        server.abort();
+        result.expect("重试后的响应体不能重新获得完整预算");
+        assert!(deadline.is_expired());
+    }
 
     #[test]
     fn test_message_user() {
