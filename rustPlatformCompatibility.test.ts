@@ -89,6 +89,15 @@ test('Windows 发布构建应保留明确类型并隔离 Unix 测试依赖', () 
   );
 });
 
+test('Tauri 构建的 macOS SDK 应跟随所选 Xcode，而不是固定为 CLT SDK', () => {
+  const config = readSource('./src-tauri/.cargo/config.toml');
+  assert.doesNotMatch(config, /^\s*SDKROOT\s*=/m,
+    '固定的 CLT SDK 可能高于所选 Xcode 链接器，导致 libSystem.tbd unknown architecture');
+  for (const target of ['aarch64_apple_darwin', 'x86_64_apple_darwin']) {
+    assert.ok(config.includes(`CC_${target} = "/usr/bin/cc"`), '保留显式系统编译器，防止 PATH 中的同名工具覆盖');
+  }
+});
+
 test('常规 CI 应在 macOS、Linux 和 Windows 执行 Rust 零警告门禁', () => {
   const workflow = readSource('./.github/workflows/ci.yml');
   const backend = workflow.match(/\n  backend:\n[\s\S]*$/)?.[0] ?? '';
