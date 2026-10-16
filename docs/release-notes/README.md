@@ -52,4 +52,6 @@ Release body 形如：
 - The existing five-platform build matrix and all release gates also apply to RCs. A release is published only after all build jobs succeed.
 - RC releases set `prerelease: true` and `makeLatest: false`. Stable clients retain their existing `/releases/latest/download/` endpoints; testers install RC assets manually. RC installations also remain on the stable update endpoint.
 - Test with backed-up or disposable data. Verify Windows OCR, fast application switching, privacy saves after restart, category management, data migration, and installer upgrades before promoting to a stable version.
-- Promotion requires a separate stable version bump and tag; do not relabel the RC release or move an existing tag.
+- A packaging/build failure does not authorize incrementing the RC version. Explain the failure and obtain approval before changing the planned version.
+- Never move tags for published releases. A failed, unpublished RC tag may be recreated at a corrected `origin/main` commit only with explicit user authorization; rerun the complete release gates. Delete only the failed runs named by the user. Withdrawing any successful release or its tag requires separate approval.
+- Promotion requires a separate stable version bump and tag; do not relabel an RC release or move a published tag.
